@@ -4,10 +4,7 @@ const { composePlugins, withNx } = require("@nx/webpack");
 const { withReact } = require("@nx/react");
 const { merge } = require("webpack-merge");
 
-require("dotenv").config({
-  // resolve the .env file in the root of the project ../
-  path: path.resolve(__dirname, "../.env"),
-});
+require("dotenv").config();
 
 const MiniCssExtractPlugin = require("mini-css-extract-plugin");
 const { EnvironmentPlugin, DefinePlugin, ProgressPlugin, optimize } = require("webpack");
@@ -16,23 +13,38 @@ const CssMinimizerPlugin = require("css-minimizer-webpack-plugin");
 
 const RELEASE = require("./release").getReleaseName();
 
-const css_prefix = "lsf-";
-const mode = process.env.BUILD_MODULE ? "production" : process.env.NODE_ENV || "development";
-const isDevelopment = mode !== "production";
-const devtool = process.env.NODE_ENV === "production" ? "source-map" : "cheap-module-source-map";
-const FRONTEND_HMR = process.env.FRONTEND_HMR === "true";
-const FRONTEND_HOSTNAME = FRONTEND_HMR ? process.env.FRONTEND_HOSTNAME || "http://localhost:8010" : "";
-const DJANGO_HOSTNAME = process.env.DJANGO_HOSTNAME || "http://localhost:8080";
-const HMR_PORT = FRONTEND_HMR ? +new URL(FRONTEND_HOSTNAME).port : 8010;
+let css_prefix;
+
+switch (process.env.LERNA_PACKAGE_NAME) {
+  case "labelstudio":
+    css_prefix = "ls-";
+    break;
+  case "datamanager":
+    css_prefix = "dm-";
+    break;
+  case "editor":
+    css_prefix = "lsf-";
+}
 
 const LOCAL_ENV = {
-  NODE_ENV: mode,
+  NODE_ENV: "development",
   CSS_PREFIX: css_prefix,
   RELEASE_NAME: RELEASE,
 };
 
+const devtool = process.env.NODE_ENV === "production" ? "source-map" : "cheap-module-source-map";
+
+const DEFAULT_NODE_ENV = process.env.BUILD_MODULE ? "production" : process.env.NODE_ENV || "development";
+const isDevelopment = DEFAULT_NODE_ENV !== "production";
+const customDistDir = !!process.env.WORK_DIR;
+
 const BUILD = {
   NO_MINIMIZE: isDevelopment || !!process.env.BUILD_NO_MINIMIZATION,
+};
+
+const dirPrefix = {
+  js: customDistDir ? "js/" : isDevelopment ? "" : "static/js/",
+  css: customDistDir ? "css/" : isDevelopment ? "" : "static/css/",
 };
 
 const plugins = [
@@ -43,13 +55,22 @@ const plugins = [
   new EnvironmentPlugin(LOCAL_ENV),
 ];
 
+if (process.env.MODE !== "standalone") {
+  plugins.push(
+    new optimize.LimitChunkCountPlugin({
+      maxChunks: 1,
+    }),
+  );
+}
+
 const optimizer = () => {
   const result = {
     minimize: true,
     minimizer: [],
+    runtimeChunk: true,
   };
 
-  if (mode === "production") {
+  if (DEFAULT_NODE_ENV === "production") {
     result.minimizer.push(
       new TerserPlugin({
         parallel: true,
@@ -65,10 +86,8 @@ const optimizer = () => {
     result.minimizer = undefined;
   }
 
-  if (process.env.MODE === "standalone") {
-    result.runtimeChunk = false;
-    result.splitChunks = { cacheGroups: { default: false } };
-  }
+  result.runtimeChunk = false;
+  result.splitChunks = { cacheGroups: { default: false } };
 
   return result;
 };
@@ -83,47 +102,19 @@ module.exports = composePlugins(
   }),
   withReact({ svgr: true }),
   (config) => {
-    // LS entrypoint
-    if (process.env.MODE !== "standalone") {
-      config.entry = {
-        main: {
-          import: path.resolve(__dirname, "apps/labelstudio/src/main.tsx"),
-        },
-      };
+    // Update the webpack config as needed here.
+    // e.g. `config.plugins.push(new MyPlugin())`
 
-      config.output = {
-        ...config.output,
-        uniqueName: "labelstudio",
-        publicPath: isDevelopment && FRONTEND_HOSTNAME ? `${FRONTEND_HOSTNAME}/react-app/` : "auto",
-        scriptType: "text/javascript",
-      };
+    config.output = {
+      ...config.output,
+      uniqueName: "labelstudio",
+      publicPath: "auto",
+      scriptType: "text/javascript",
+    };
 
-      config.optimization = {
-        runtimeChunk: "single",
-        sideEffects: true,
-        splitChunks: {
-          cacheGroups: {
-            commonVendor: {
-              test: /[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom|mobx|mobx-react|mobx-react-lite|mobx-state-tree)[\\/]/,
-              name: "vendor",
-              chunks: "all",
-            },
-            defaultVendors: {
-              test: /[\\/]node_modules[\\/]/,
-              priority: -10,
-              reuseExistingChunk: true,
-              chunks: "async",
-            },
-            default: {
-              minChunks: 2,
-              priority: -20,
-              reuseExistingChunk: true,
-              chunks: "async",
-            },
-          },
-        },
-      };
-    }
+    config.optimization = {
+      splitChunks: false,
+    };
 
     config.resolve.fallback = {
       fs: false,
@@ -160,7 +151,7 @@ module.exports = composePlugins(
         });
       }
 
-      if (rule.test.toString().match(/scss|sass/) && !isCssModule) {
+      if (rule.test.toString().match(/scss|sass|styl/) && !isCssModule) {
         const r = rule.oneOf.filter((r) => {
           // we don't need rules that don't have loaders
           if (!r.use) return false;
@@ -172,7 +163,7 @@ module.exports = composePlugins(
           if (testString.match(/module/)) return false;
 
           // we only target pre-processors that has 'css-loader included'
-          return testString.match(/scss|sass/) && r.use.some((u) => u.loader && u.loader.includes("css-loader"));
+          return testString.match(/scss|sass|styl/) && r.use.some((u) => u.loader && u.loader.includes("css-loader"));
         });
 
         r.forEach((_r) => {
@@ -221,48 +212,17 @@ module.exports = composePlugins(
         loader: "file-loader",
         options: {
           name: "[name].[ext]",
+          outputPath: dirPrefix.js, // colocate wasm with js
         },
       },
     );
 
-    if (isDevelopment) {
-      config.optimization = {
-        ...config.optimization,
-        moduleIds: "named",
-      };
-    }
-
+    // update the stylus loader to include an import of a global file
     return merge(config, {
       devtool,
-      mode,
+      mode: process.env.NODE_ENV || "development",
       plugins,
       optimization: optimizer(),
-      devServer:
-        process.env.MODE === "standalone"
-          ? {}
-          : {
-              // Port for the Webpack dev server
-              port: HMR_PORT,
-              // Enable HMR
-              hot: true,
-              // Allow cross-origin requests from Django
-              headers: { "Access-Control-Allow-Origin": "*" },
-              static: {
-                directory: path.resolve(__dirname, "../label_studio/core/static/"),
-                publicPath: "/static/",
-              },
-              devMiddleware: {
-                publicPath: `${FRONTEND_HOSTNAME}/react-app/`,
-              },
-              allowedHosts: "all", // Allow access from Django's server
-              proxy: [
-                {
-                  router: {
-                    "/api": `${DJANGO_HOSTNAME}/api`, // Proxy api requests to Django's server
-                  },
-                },
-              ],
-            },
     });
   },
 );
